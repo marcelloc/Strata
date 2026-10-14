@@ -10,6 +10,9 @@
 #
 # Device code is JIT-compiled from SPIR-V unless STRATA_SYCL_AOT names a device (bmg-g31 for the Arc Pro B70).
 cmake_minimum_required(VERSION 3.24)
+if(CMAKE_HOST_WIN32)
+  cmake_minimum_required(VERSION 3.25) # IntelLLVM target link options on Windows
+endif()
 # the engine's version is the project's (../CMakeLists.txt): the log line and BUILD.json say 0.1.40.2, not a number of the port's own
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/../CMakeLists.txt _strata_proj REGEX "^project\\(strata VERSION [0-9.]+")
 string(REGEX MATCH "VERSION ([0-9.]+)" _m "${_strata_proj}")
@@ -27,6 +30,30 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+
+if(WIN32)
+  if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "Windows SYCL needs Intel oneAPI icx and an x64 Visual Studio environment; see docs/BUILD_WINDOWS_SYCL.md")
+  endif()
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+# Select host switches by driver syntax, not just by operating system.
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+  set(_sycl_fp /fp:precise)
+  set(_sycl_mkl /Qmkl:sequential)
+  # icx's /arch:AVX512 does not include the VNNI and VBMI instructions
+  # used by the CPU expert kernels; match the Linux feature set explicitly.
+  set(_sycl_avx512 /arch:AVX512 /clang:-mavx512vnni /clang:-mavx512vbmi)
+  set(_sycl_avx2 /arch:AVX2)
+  set(_sycl_avx /arch:AVX)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/EHsc> /bigobj)
+else()
+  set(_sycl_fp -fp-model=precise)
+  set(_sycl_mkl -qmkl=sequential)
+  set(_sycl_avx512 -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi -mf16c -mfma)
+  set(_sycl_avx2 -mavx2 -mfma -mf16c)
+  set(_sycl_avx -mavx)
+endif()
 
 set(STRATA_SYCL_AOT "" CACHE STRING "AOT device for the GPU code, e.g. bmg-g31 (empty: SPIR-V, JIT at run time)")
 # The device spins on host flags are bounded (include/strata/sycl_doorbell.hpp). The bound is chosen per device at run
@@ -80,9 +107,36 @@ list(APPEND _sycl_flags -fsycl-default-sub-group-size=32)
 # split the first launch in the prompt path (the embedding gather) paid 245 ms for the image it shared (2026-09-30).
 list(APPEND _sycl_link -fsycl-device-code-split=per_kernel)
 list(APPEND _sycl_flags -fsycl-device-code-split=per_kernel)
-add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" -fp-model=precise -Wno-unused-parameter
+add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_sycl_flags}>" ${_sycl_fp} -Wno-unused-parameter
                     -Wno-unused-variable -Wno-deprecated-declarations)
 add_link_options(${_sycl_link})
+
+# Compile AND link a device kernel and a BLAS call. This requires no GPU and
+# detects missing SYCL/oneMKL libraries, unsupported switches and AOT targets.
+if(WIN32)
+  include(CheckCXXSourceCompiles)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  string(JOIN " " CMAKE_REQUIRED_FLAGS ${_sycl_flags} ${_sycl_fp} ${_sycl_mkl})
+  set(CMAKE_REQUIRED_LINK_OPTIONS ${_sycl_link} ${_sycl_mkl})
+  unset(STRATA_WINDOWS_SYCL_LINKS CACHE)
+  check_cxx_source_compiles([=[
+    #include <sycl/sycl.hpp>
+    #include <oneapi/mkl.hpp>
+    int main() {
+      sycl::queue q;
+      float* p = sycl::malloc_shared<float>(1, q);
+      q.single_task([=] { *p = 1; }).wait();
+      oneapi::mkl::blas::column_major::gemm(q, oneapi::mkl::transpose::nontrans,
+        oneapi::mkl::transpose::nontrans, 1, 1, 1, 1.0f, p, 1, p, 1, 0.0f, p, 1).wait();
+      sycl::free(p, q);
+    }
+  ]=] STRATA_WINDOWS_SYCL_LINKS)
+  cmake_pop_check_state()
+  if(NOT STRATA_WINDOWS_SYCL_LINKS)
+    message(FATAL_ERROR "SYCL + oneMKL compile/link probe failed. Inspect CMakeFiles/CMakeConfigureLog.yaml (older CMake: CMakeError.log). Activate oneAPI and VS x64; try JIT before AOT.")
+  endif()
+endif()
 
 # --- source resolution: the migrated copy when there is one, the original otherwise -------------------------------
 function(strata_resolve out)
@@ -122,11 +176,11 @@ strata_resolve(_cpu src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp src/kern
                     src/kernels/cpu/q2_avx2.cpp)
 add_library(strata_kernels_cpu STATIC ${_cpu})
 set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS
-  "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  "${_sycl_avx512}")
+set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_sycl_avx2}")
 # AVX-VNNI copies of the AVX-2 expert kernels (q2_avx2.cpp, iq_avx2.cpp), taken at run time where the CPU has them
 include(CheckCXXSourceCompiles)
-set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
+string(JOIN " " CMAKE_REQUIRED_FLAGS ${_sycl_avx2})
 check_cxx_source_compiles([=[
 #include <immintrin.h>
 #if defined(__GNUC__) || defined(__clang__)
@@ -186,14 +240,19 @@ if(STRATA_NATIVE_EXPERTS)
                              src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp)   # NVFP4 expert rows (native_expert.cpp calls them)
   target_sources(strata_kernels_cpu PRIVATE ${_cpu_native})
   target_include_directories(strata_kernels_cpu PRIVATE ${STRATA_ROOT}/third_party/ggml)
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx512.cpp ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx512.cpp
-    PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx512.cpp ${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx512.cpp PROPERTIES COMPILE_OPTIONS
+    "${_sycl_avx512}")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/nvfp4_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_sycl_avx2}")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_sycl_avx2}")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_sycl_avx2}")
+  set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "${_sycl_avx}")
+  if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    set(_sycl_avx1_only /arch:AVX /clang:-msse4.2 /clang:-mno-avx2 /clang:-mno-fma /clang:-mno-f16c)
+  else()
+    set(_sycl_avx1_only -msse4.2 -mavx -mno-avx2 -mno-fma -mno-f16c)
+  endif()
   set_source_files_properties(${STRATA_ROOT}/src/kernels/cpu/q2_avx1.cpp ${STRATA_ROOT}/src/kernels/cpu/iq_avx1.cpp PROPERTIES
-    COMPILE_OPTIONS "-msse4.2;-mavx;-mno-avx2;-mno-fma;-mno-f16c")
+    COMPILE_OPTIONS "${_sycl_avx1_only}")
   set_property(SOURCE ${STRATA_ROOT}/src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
@@ -206,8 +265,15 @@ add_library(strata_core STATIC ${_core})
 target_link_libraries(strata_core PUBLIC strata_includes)
 # zeMemAllocHost for the host memory a kernel polls (include/strata/sycl_queue.hpp, host_malloc_polled): only when libze-dev's header is there
 find_library(STRATA_ZE_LOADER ze_loader)
-if(STRATA_ZE_LOADER)
+find_path(STRATA_ZE_INCLUDE_DIR level_zero/ze_api.h HINTS ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES})
+if(STRATA_ZE_LOADER AND STRATA_ZE_INCLUDE_DIR)
+  target_compile_definitions(strata_includes INTERFACE STRATA_HAVE_ZE=1)
+  target_include_directories(strata_includes INTERFACE ${STRATA_ZE_INCLUDE_DIR})
   target_link_libraries(strata_core PUBLIC ${STRATA_ZE_LOADER})
+elseif(WIN32)
+  message(FATAL_ERROR "Level Zero development files required: set STRATA_ZE_INCLUDE_DIR and STRATA_ZE_LOADER (ze_loader.lib). A driver DLL alone is insufficient.")
+else()
+  target_compile_definitions(strata_includes INTERFACE STRATA_DISABLE_ZE=1)
 endif()
 
 set(_kernel_cu dequant_s2 s2_gemv s_gemv s2_gemv_quads s2_gemv_fast router_top10 quantize_act rope sampler s2_gemv_q8
@@ -240,15 +306,17 @@ target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_ker
 # cuBLAS -> oneMKL through dpct::blas (needs the MKL SYCL BLAS domain)
 strata_resolve(_prefill src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
 add_library(strata_prefill STATIC ${_prefill}
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp   # upstream's fused int8 kernels: not built here
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)      # A770 port: grouped XMX expert GEMM
-target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
-target_link_options(strata_prefill PUBLIC -qmkl=sequential)
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_fused_stub.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)
+target_compile_options(strata_prefill PUBLIC ${_sycl_mkl})
+target_link_options(strata_prefill PUBLIC ${_sycl_mkl})
 target_link_libraries(strata_prefill PUBLIC strata_engine)
 
 strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
+add_executable(strata-sycl-diagnostic probe/device_info.cpp)
+target_link_libraries(strata-sycl-diagnostic PRIVATE strata_includes)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)

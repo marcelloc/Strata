@@ -163,9 +163,7 @@ Things that matter on an Arc (details in INTEL.md):
 
 ## Windows
 
-There is no Windows path yet. `setup --backend sycl` on Windows stops and points here. oneAPI exists for Windows,
-but `sycl/CMakeLists.txt` uses GCC-style flags (`-mavx512f`, `-fp-model=precise`, `-qmkl`) and the runner is a
-bash/Docker script, so a native Windows build would need work. Nobody has tried it. WSL2 with an Arc has been
+An experimental manual native build is described in [BUILD_WINDOWS_SYCL.md](BUILD_WINDOWS_SYCL.md). See [TEST_B70_WINDOWS.md](TEST_B70_WINDOWS.md) for B70 validation and remaining gaps. The Windows setup wizard is not implemented by this change. WSL2 with an Arc has been
 used by one tester (the B580 row above), but setup cannot detect the card there, because it reads `/sys/class/drm`,
 which WSL2 does not have.
 

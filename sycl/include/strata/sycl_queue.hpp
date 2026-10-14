@@ -45,7 +45,7 @@ inline void big_fill_zero(sycl::queue& q, void* p, size_t bytes, size_t chunk = 
 // from zeMemAllocHost with ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED does work there (sycl/probe/doorbell.cpp mode 2,
 // "HANDSHAKE OK"), so those buffers come from it when the Level Zero headers are present (libze-dev), else from
 // sycl::malloc_host. STRATA_HOST_UNCACHED=0 turns it off.
-#if defined(__has_include)
+#if !defined(STRATA_DISABLE_ZE) && defined(__has_include)
 #if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
 #include <level_zero/ze_api.h>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
@@ -100,6 +100,7 @@ inline void host_free_polled(void* p, sycl::queue& q) {
 namespace strata {
 inline const std::string& intel_gpu_driver() {
     static const std::string drv = [] {
+#if defined(__linux__)
         std::error_code ec;
         for (const auto& e : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
             const std::string n = e.path().filename().string();
@@ -110,6 +111,7 @@ inline const std::string& intel_gpu_driver() {
             const auto d = std::filesystem::read_symlink(e.path() / "device" / "driver", ec);
             if (!ec) return d.filename().string();
         }
+#endif
         return std::string();
     }();
     return drv;
